@@ -352,6 +352,33 @@ class TestRailMCPServer(FastMCP):
 
             return self.client.move_section(section_id, data)
 
+        # Attachment tools
+        @self.tool("get_attachments_for_case", description="Get all attachments for a test case")
+        def get_attachments_for_case(
+            case_id: int,
+            limit: Optional[int] = None,
+            offset: Optional[int] = None
+        ) -> Dict:
+            """
+            Get all attachments for a test case.
+
+            Args:
+                case_id: The ID of the test case
+                limit: Number of attachments to return (default 250, requires TestRail 6.7+)
+                offset: Starting position for pagination (requires TestRail 6.7+)
+            """
+            return self.client.get_attachments_for_case(case_id, limit, offset)
+
+        @self.tool("get_attachment", description="Download an attachment by ID. Returns base64-encoded content and content type.")
+        def get_attachment(attachment_id: str) -> Dict:
+            """
+            Download an attachment by ID.
+
+            Args:
+                attachment_id: The ID of the attachment (string to support both integer and UUID formats)
+            """
+            return self.client.get_attachment(attachment_id)
+
         # Run tools
         @self.tool("get_run", description="Get a test run by ID")
         def get_run(run_id: int) -> Dict:

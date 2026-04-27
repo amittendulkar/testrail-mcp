@@ -74,6 +74,32 @@ class TestRailClient:
             
         return response.json() if response.content else {}
 
+    def _send_request_raw(self, method: str, uri: str) -> requests.Response:
+        """
+        Send a request and return the raw response (for binary downloads).
+
+        Args:
+            method: HTTP method (GET)
+            uri: API endpoint URI
+
+        Returns:
+            Raw requests.Response object
+
+        Raises:
+            Exception: If the request fails
+        """
+        url = self.base_url + uri
+        response = self.session.get(url)
+
+        if response.status_code >= 300:
+            try:
+                error = response.json()
+            except:
+                error = response.text
+            raise Exception(f"TestRail API returned HTTP {response.status_code}: {error}")
+
+        return response
+
     # Cases API
     def get_case(self, case_id: int) -> Dict:
         """Get a test case by ID."""
@@ -214,3 +240,24 @@ class TestRailClient:
     def move_section(self, section_id:int, data: Dict) -> Dict:
         """Move a section to a different parent or position"""
         return self._send_request('POST', f'move_section/{section_id}', data)
+
+    # Attachments API
+    def get_attachments_for_case(self, case_id: int, limit: Optional[int] = None, offset: Optional[int] = None) -> Dict:
+        """Get all attachments for a test case."""
+        uri = f'get_attachments_for_case/{case_id}'
+        params = []
+        if limit is not None:
+            params.append(f'limit={limit}')
+        if offset is not None:
+            params.append(f'offset={offset}')
+        if params:
+            uri += '&' + '&'.join(params)
+        return self._send_request('GET', uri)
+
+    def get_attachment(self, attachment_id: str) -> Dict:
+        """Download an attachment by ID. Returns base64-encoded content."""
+        response = self._send_request_raw('GET', f'get_attachment/{attachment_id}')
+        return {
+            'data': base64.b64encode(response.content).decode('ascii'),
+            'content_type': response.headers.get('Content-Type', 'application/octet-stream'),
+        }
