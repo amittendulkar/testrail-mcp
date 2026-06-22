@@ -497,6 +497,17 @@ class TestRailMCPServer(FastMCP):
             """
             return self.client.delete_run(run_id)
         
+        # Tests tools
+        @self.tool("get_tests", description="Get all tests for a test run")
+        def get_tests(run_id: int) -> List[Dict]:
+            """
+            Get all tests for a test run.
+
+            Args:
+                run_id: The ID of the test run
+            """
+            return self.client.get_tests(run_id)
+
         # Results tools
         @self.tool("get_results", description="Get all test results for a test")
         def get_results(test_id: int) -> List[Dict]:
