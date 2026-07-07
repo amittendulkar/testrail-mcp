@@ -24,9 +24,9 @@ class TestRailMCPServer(FastMCP):
             """Get a project by ID."""
             return self.client.get_project(project_id)
         
-        @self.tool("get_projects", description="Get all projects")
-        def get_projects() -> List[Dict]:
-            """Get all projects."""
+        @self.tool("get_projects", description="Get all projects (auto-paginated)")
+        def get_projects() -> Dict:
+            """Get all projects (auto-paginated)."""
             return self.client.get_projects()
         
         @self.tool("add_project", description="Add a new project")
@@ -104,16 +104,19 @@ class TestRailMCPServer(FastMCP):
             """
             return self.client.get_case(case_id)
         
-        @self.tool("get_cases", description="Get all test cases for a project/suite")
-        def get_cases(project_id: int, suite_id: Optional[int] = None) -> List[Dict]:
+        @self.tool("get_cases",
+                   description="Get all test cases for a project/suite (auto-paginated; optional section_id filter)")
+        def get_cases(project_id: int, suite_id: Optional[int] = None,
+                      section_id: Optional[int] = None) -> Dict:
             """
-            Get all test cases for a project/suite.
+            Get all test cases for a project/suite (auto-paginated).
             
             Args:
                 project_id: The ID of the project
                 suite_id: The ID of the test suite (optional)
+                section_id: Restrict to a single section (optional)
             """
-            return self.client.get_cases(project_id, suite_id)
+            return self.client.get_cases(project_id, suite_id, section_id)
         
         @self.tool("add_case", description="Add a new test case")
         def add_case(
@@ -254,12 +257,12 @@ class TestRailMCPServer(FastMCP):
             """
             return self.client.get_section(section_id)
 
-        @self.tool("get_sections", description="Retrieves all sections for a specified project and or suite")
+        @self.tool("get_sections", description="Retrieves all sections for a specified project and or suite (auto-paginated)")
         def get_sections(
             project_id : int,
             suite_id: Optional[int] = None ) -> Dict:
             """
-            Retrieves all sections for a specified project and suite
+            Retrieves all sections for a specified project and suite (auto-paginated)
             
             Args:
                 project_id: The ID of the project

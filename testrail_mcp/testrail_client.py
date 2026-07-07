@@ -100,17 +100,80 @@ class TestRailClient:
 
         return response
 
+    @staticmethod
+    def _extract_next_uri(next_link: str) -> Optional[str]:
+        """
+        Turn a TestRail `_links.next` value into a base_url-relative URI.
+
+        `base_url` already ends with `index.php?/api/v2/`, so the leading `/api/v2/` from
+        the next link must be stripped before appending. If the `api/v2/` marker is absent
+        (clean-URL installs / proxy path rewrites), the link is un-parseable in this context;
+        return None to STOP rather than build a malformed URL and loop on a bad page.
+        """
+        marker = 'api/v2/'
+        idx = next_link.lower().find(marker)
+        if idx == -1:
+            return None
+        return next_link[idx + len(marker):].lstrip('/')
+
+    def _get_paginated(self, uri: str, entity_key: str, max_pages: int = 1000) -> Dict:
+        """
+        Fetch ALL pages of a paginated TestRail bulk-API GET endpoint.
+
+        Handles both response shapes:
+          * bulk API (recent TestRail): {offset, limit, size, _links:{next}, <entity_key>:[...]}
+          * legacy bare list:           [ ... ]
+
+        Returns a normalized dict: {entity_key: [all items], "size": <total>}.
+        """
+        items: List[Dict] = []
+        # Request an explicit page size so behaviour is deterministic across TestRail
+        # versions/config and the offset arithmetic in `_links.next` is predictable.
+        next_uri: Optional[str] = uri if 'limit=' in uri else f'{uri}&limit=250'
+        prev_uri: Optional[str] = None
+        pages = 0
+
+        while next_uri and pages < max_pages:
+            # Offset-monotonicity guard: if the derived next link does not advance, stop
+            # after one extra request instead of hammering the same page `max_pages` times.
+            if next_uri == prev_uri:
+                break
+            pages += 1
+            resp = self._send_request('GET', next_uri)
+            prev_uri = next_uri
+
+            # Legacy TestRail returned a bare list (no pagination envelope). An empty
+            # response (`{}`) yields items=[] with no `_links` and breaks cleanly below.
+            if isinstance(resp, list):
+                items.extend(resp)
+                break
+            if not isinstance(resp, dict):
+                break
+
+            items.extend(resp.get(entity_key, []) or [])
+
+            nxt = (resp.get('_links') or {}).get('next')
+            if not nxt:
+                break
+            # '/api/v2/get_cases/137&limit=250&offset=250' -> 'get_cases/137&limit=250&offset=250'
+            next_uri = self._extract_next_uri(nxt)
+
+        return {entity_key: items, "size": len(items)}
+
     # Cases API
     def get_case(self, case_id: int) -> Dict:
         """Get a test case by ID."""
         return self._send_request('GET', f'get_case/{case_id}')
     
-    def get_cases(self, project_id: int, suite_id: Optional[int] = None) -> List[Dict]:
-        """Get all test cases for a project/suite."""
+    def get_cases(self, project_id: int, suite_id: Optional[int] = None,
+                  section_id: Optional[int] = None) -> Dict:
+        """Get ALL test cases for a project/suite (auto-paginated). Optional section_id filter."""
         uri = f'get_cases/{project_id}'
         if suite_id:
             uri += f'&suite_id={suite_id}'
-        return self._send_request('GET', uri)
+        if section_id:
+            uri += f'&section_id={section_id}'
+        return self._get_paginated(uri, 'cases')
     
     def add_case(self, section_id: int, data: Dict) -> Dict:
         """Add a new test case."""
@@ -129,9 +192,9 @@ class TestRailClient:
         """Get a project by ID."""
         return self._send_request('GET', f'get_project/{project_id}')
     
-    def get_projects(self) -> List[Dict]:
-        """Get all projects."""
-        return self._send_request('GET', 'get_projects')
+    def get_projects(self) -> Dict:
+        """Get ALL projects (auto-paginated)."""
+        return self._get_paginated('get_projects', 'projects')
     
     def add_project(self, data: Dict) -> Dict:
         """Add a new project."""
@@ -222,10 +285,12 @@ class TestRailClient:
         """Get a specific section"""
         return self._send_request('GET', f'get_section/{section_id}')
 
-    def get_sections(self, project_id: int, suite_id:Optional[int] = None, params:Optional[Dict] = None) -> Dict:
-        """Get all sections for a project"""
-        query_params = {**params, "suite_id": suite_id} if suite_id else params
-        return self._send_request('GET', f'get_sections/{project_id}',{params : query_params})
+    def get_sections(self, project_id: int, suite_id: Optional[int] = None) -> Dict:
+        """Get ALL sections for a project/suite (auto-paginated)."""
+        uri = f'get_sections/{project_id}'
+        if suite_id:
+            uri += f'&suite_id={suite_id}'
+        return self._get_paginated(uri, 'sections')
 
     def add_section(self, project_id:int, data:Dict) -> Dict:
         """Add a new section"""
