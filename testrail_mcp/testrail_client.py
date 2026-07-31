@@ -1,13 +1,29 @@
 """TestRail API client module."""
 import base64
 import json
-from typing import Dict, List, Any, Optional, Union
+import time
+import random
+from typing import Dict, List, Any, Optional, Union, Tuple
 import requests
+
+# (connect timeout, read timeout) in seconds. TestRail bulk queries on large
+# projects can be slow, so the read timeout is generous while the connect
+# timeout stays short to fail fast on unreachable hosts.
+DEFAULT_TIMEOUT: Tuple[float, float] = (10.0, 60.0)
+
+# HTTP status codes worth retrying (rate limiting + transient server errors).
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_BACKOFF_BASE = 1.0  # seconds; exponential: base * 2**attempt (+ jitter)
+
 
 class TestRailClient:
     """TestRail API client for interacting with TestRail."""
 
-    def __init__(self, base_url: str, username: str, api_key: str):
+    def __init__(self, base_url: str, username: str, api_key: str,
+                 timeout: Tuple[float, float] = DEFAULT_TIMEOUT,
+                 max_retries: int = DEFAULT_MAX_RETRIES,
+                 backoff_base: float = DEFAULT_BACKOFF_BASE):
         """
         Initialize the TestRail API client.
         
@@ -15,9 +31,15 @@ class TestRailClient:
             base_url: The URL of your TestRail instance (e.g., [https://example.testrail.io/)](https://example.testrail.io/))
             username: Your TestRail username/email
             api_key: Your TestRail API key
+            timeout: (connect, read) timeout in seconds for every HTTP request
+            max_retries: Number of retries for transient failures (429/5xx/network)
+            backoff_base: Base seconds for exponential backoff between retries
         """
         self.username = username
         self.api_key = api_key
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.backoff_base = backoff_base
         
         # Ensure the base URL ends with a slash
         if not base_url.endswith('/'):
@@ -37,6 +59,63 @@ class TestRailClient:
             'Content-Type': 'application/json',
         })
 
+    def _sleep_backoff(self, attempt: int, retry_after: Optional[str] = None) -> None:
+        """Sleep before a retry using Retry-After (if present) or exponential backoff."""
+        if retry_after:
+            try:
+                time.sleep(min(float(retry_after), 60.0))
+                return
+            except (TypeError, ValueError):
+                pass
+        delay = self.backoff_base * (2 ** attempt)
+        # Full jitter to avoid thundering-herd retries across concurrent calls.
+        time.sleep(min(delay + random.uniform(0, self.backoff_base), 60.0))
+
+    def _execute(self, method: str, url: str, data: Optional[Dict] = None) -> requests.Response:
+        """
+        Perform a single HTTP request with a timeout, retrying transient failures.
+
+        Retries on network errors (connect/read timeouts, connection drops) and on
+        429/5xx responses, using Retry-After or exponential backoff. Non-retryable
+        HTTP errors (e.g. 4xx) are returned to the caller for error extraction.
+        """
+        method = method.upper()
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                if method == 'GET':
+                    response = self.session.get(url, timeout=self.timeout)
+                elif method == 'POST':
+                    response = self.session.post(
+                        url, data=json.dumps(data) if data else None, timeout=self.timeout)
+                elif method == 'PUT':
+                    response = self.session.put(
+                        url, data=json.dumps(data) if data else None, timeout=self.timeout)
+                elif method == 'DELETE':
+                    response = self.session.delete(url, timeout=self.timeout)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                # Transient network problem: retry with backoff, then re-raise.
+                last_exc = exc
+                if attempt < self.max_retries:
+                    self._sleep_backoff(attempt)
+                    continue
+                raise Exception(
+                    f"TestRail request to {url} failed after "
+                    f"{self.max_retries + 1} attempts: {exc}"
+                ) from exc
+
+            if response.status_code in RETRYABLE_STATUS and attempt < self.max_retries:
+                self._sleep_backoff(attempt, response.headers.get('Retry-After'))
+                continue
+
+            return response
+
+        # Unreachable in practice, but keeps type-checkers happy.
+        raise Exception(f"TestRail request to {url} failed: {last_exc}")
+
     def _send_request(self, method: str, uri: str, data: Optional[Dict] = None) -> Any:
         """
         Send a request to the TestRail API.
@@ -53,18 +132,8 @@ class TestRailClient:
             Exception: If the request fails
         """
         url = self.base_url + uri
-        
-        if method.upper() == 'GET':
-            response = self.session.get(url)
-        elif method.upper() == 'POST':
-            response = self.session.post(url, data=json.dumps(data) if data else None)
-        elif method.upper() == 'PUT':
-            response = self.session.put(url, data=json.dumps(data) if data else None)
-        elif method.upper() == 'DELETE':
-            response = self.session.delete(url)
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
-            
+        response = self._execute(method, url, data)
+
         if response.status_code >= 300:
             try:
                 error = response.json()
@@ -89,7 +158,7 @@ class TestRailClient:
             Exception: If the request fails
         """
         url = self.base_url + uri
-        response = self.session.get(url)
+        response = self._execute(method, url)
 
         if response.status_code >= 300:
             try:
@@ -116,49 +185,101 @@ class TestRailClient:
             return None
         return next_link[idx + len(marker):].lstrip('/')
 
-    def _get_paginated(self, uri: str, entity_key: str, max_pages: int = 1000) -> Dict:
+    def _get_paginated(self, uri: str, entity_key: str, max_pages: int = 1000,
+                       start_offset: int = 0, page_size: int = 250,
+                       id_key: Optional[str] = 'id') -> Dict:
         """
-        Fetch ALL pages of a paginated TestRail bulk-API GET endpoint.
+        Fetch pages of a paginated TestRail bulk-API GET endpoint.
 
         Handles both response shapes:
           * bulk API (recent TestRail): {offset, limit, size, _links:{next}, <entity_key>:[...]}
           * legacy bare list:           [ ... ]
 
-        Returns a normalized dict: {entity_key: [all items], "size": <total>}.
+        Args:
+            uri: endpoint URI (may already contain query params joined with '&')
+            entity_key: response key holding the list (e.g. 'cases', 'tests')
+            max_pages: max pages to fetch in THIS call. Bound it to keep a single
+                MCP call under the client's request deadline. When more data
+                remains, `next_offset`/`is_last` in the result let the caller resume.
+            start_offset: offset to begin at (for resumable/cursor paging)
+            page_size: rows per page (TestRail max is 250)
+            id_key: field used to de-duplicate rows across pages/resumes. Offset
+                paging can repeat rows if cases are edited mid-scan; de-dup makes
+                the merged result safe. Set None to disable.
+
+        Returns a normalized dict:
+            {
+              entity_key: [items...],   # items fetched in THIS call
+              "size": <int>,            # len of items in THIS call
+              "offset": <start_offset>,
+              "next_offset": <int|None>, # pass back as offset= to continue; None if done
+              "is_last": <bool>,         # True when no more pages remain
+              "pages_fetched": <int>
+            }
         """
         items: List[Dict] = []
-        # Request an explicit page size so behaviour is deterministic across TestRail
-        # versions/config and the offset arithmetic in `_links.next` is predictable.
-        next_uri: Optional[str] = uri if 'limit=' in uri else f'{uri}&limit=250'
+        seen_ids: set = set()
+        page_size = max(1, min(int(page_size), 250))
+        offset = max(0, int(start_offset))
+
+        # Build the first page URI with explicit limit/offset so behaviour is
+        # deterministic across TestRail versions and offset arithmetic is predictable.
+        next_uri: Optional[str] = f'{uri}&limit={page_size}&offset={offset}'
         prev_uri: Optional[str] = None
         pages = 0
+        more_remaining = False
+        last_offset = offset
+
+        def _add(rows: List[Dict]) -> None:
+            for row in rows or []:
+                if id_key is not None and isinstance(row, dict) and id_key in row:
+                    rid = row[id_key]
+                    if rid in seen_ids:
+                        continue
+                    seen_ids.add(rid)
+                items.append(row)
 
         while next_uri and pages < max_pages:
             # Offset-monotonicity guard: if the derived next link does not advance, stop
-            # after one extra request instead of hammering the same page `max_pages` times.
+            # after one extra request instead of hammering the same page repeatedly.
             if next_uri == prev_uri:
                 break
             pages += 1
             resp = self._send_request('GET', next_uri)
             prev_uri = next_uri
+            last_offset = offset
 
             # Legacy TestRail returned a bare list (no pagination envelope). An empty
-            # response (`{}`) yields items=[] with no `_links` and breaks cleanly below.
+            # response (`{}`) yields items=[] with no `_links` and ends cleanly below.
             if isinstance(resp, list):
-                items.extend(resp)
+                _add(resp)
                 break
             if not isinstance(resp, dict):
                 break
 
-            items.extend(resp.get(entity_key, []) or [])
+            _add(resp.get(entity_key, []))
 
             nxt = (resp.get('_links') or {}).get('next')
             if not nxt:
                 break
-            # '/api/v2/get_cases/137&limit=250&offset=250' -> 'get_cases/137&limit=250&offset=250'
-            next_uri = self._extract_next_uri(nxt)
 
-        return {entity_key: items, "size": len(items)}
+            next_uri = self._extract_next_uri(nxt)
+            offset += page_size
+
+            # Hit this call's page budget but more data exists -> signal resume.
+            if next_uri and pages >= max_pages:
+                more_remaining = True
+                break
+
+        result = {
+            entity_key: items,
+            "size": len(items),
+            "offset": last_offset if pages else start_offset,
+            "next_offset": offset if more_remaining else None,
+            "is_last": not more_remaining,
+            "pages_fetched": pages,
+        }
+        return result
 
     # Cases API
     def get_case(self, case_id: int) -> Dict:
@@ -166,14 +287,35 @@ class TestRailClient:
         return self._send_request('GET', f'get_case/{case_id}')
     
     def get_cases(self, project_id: int, suite_id: Optional[int] = None,
-                  section_id: Optional[int] = None) -> Dict:
-        """Get ALL test cases for a project/suite (auto-paginated). Optional section_id filter."""
+                  section_id: Optional[int] = None,
+                  created_after: Optional[int] = None,
+                  updated_after: Optional[int] = None,
+                  filter: Optional[str] = None,
+                  offset: int = 0, limit: int = 250,
+                  max_pages_per_call: int = 1000) -> Dict:
+        """
+        Get test cases for a project/suite with resumable cursor paging.
+
+        With defaults it auto-paginates the whole project (backward compatible).
+        For large projects, set `max_pages_per_call` (and use the returned
+        `next_offset`) to fetch in bounded, deadline-safe batches.
+
+        Returns dict with: cases, size, offset, next_offset, is_last, pages_fetched.
+        """
         uri = f'get_cases/{project_id}'
         if suite_id:
             uri += f'&suite_id={suite_id}'
         if section_id:
             uri += f'&section_id={section_id}'
-        return self._get_paginated(uri, 'cases')
+        if created_after:
+            uri += f'&created_after={created_after}'
+        if updated_after:
+            uri += f'&updated_after={updated_after}'
+        if filter:
+            uri += f'&filter={filter}'
+        return self._get_paginated(
+            uri, 'cases', max_pages=max_pages_per_call,
+            start_offset=offset, page_size=limit, id_key='id')
     
     def add_case(self, section_id: int, data: Dict) -> Dict:
         """Add a new test case."""
@@ -234,14 +376,28 @@ class TestRailClient:
         return self._send_request('POST', f'delete_run/{run_id}')
     
     # Tests API
-    def get_tests(self, run_id: int) -> List[Dict]:
-        """Get all tests for a run."""
-        return self._send_request('GET', f'get_tests/{run_id}')
+    def get_tests(self, run_id: int, offset: int = 0, limit: int = 250,
+                  max_pages_per_call: int = 1000) -> Dict:
+        """
+        Get tests for a run with resumable cursor paging.
+
+        Returns dict with: tests, size, offset, next_offset, is_last, pages_fetched.
+        """
+        return self._get_paginated(
+            f'get_tests/{run_id}', 'tests', max_pages=max_pages_per_call,
+            start_offset=offset, page_size=limit, id_key='id')
 
     # Results API
-    def get_results(self, test_id: int) -> List[Dict]:
-        """Get all results for a test."""
-        return self._send_request('GET', f'get_results/{test_id}')
+    def get_results(self, test_id: int, offset: int = 0, limit: int = 250,
+                    max_pages_per_call: int = 1000) -> Dict:
+        """
+        Get results for a test with resumable cursor paging.
+
+        Returns dict with: results, size, offset, next_offset, is_last, pages_fetched.
+        """
+        return self._get_paginated(
+            f'get_results/{test_id}', 'results', max_pages=max_pages_per_call,
+            start_offset=offset, page_size=limit, id_key='id')
     
     def get_results_for_run(self, run_id: int) -> List[Dict]:
         """Get all results for a run."""
